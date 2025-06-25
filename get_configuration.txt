@@ -1,0 +1,832 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import sys
+import json
+import os
+
+# --- Global list to hold references to GPIO input widgets and their associated vars ---
+# These are global because add_gpio_row/remove_gpio_row functions modify them directly
+# and are called from within the GUI widgets' commands.
+gpio_input_rows = []
+gpio_row_counter = 0
+
+# Store references to interface widgets for easy management.
+# This global dict allows collect_data to access the current state of dynamic interface widgets.
+interface_widget_groups = {}
+
+
+def select_file_from_list_dialog(parent):
+    """
+    Creates a modal dialog to let the user select a JSON file from a list.
+
+    Args:
+        parent (tk.Tk or tk.Toplevel): The parent window for the dialog.
+
+    Returns:
+        str or None: The basename of the selected file, or None if cancelled or no file found.
+    """
+    config_folder = "MicropythonConfigurationFiles"
+    os.makedirs(config_folder, exist_ok=True)  # Ensure folder exists
+
+    dialog = tk.Toplevel(parent)
+    dialog.title("Select Configuration File")
+    dialog.transient(parent)  # Make it transient to the parent
+    dialog.grab_set()  # Make it modal
+
+    dialog.geometry("400x300")
+    dialog.configure(bg="#34495E")
+
+    selected_file_name = None
+
+    ttk.Label(dialog, text="Available Configuration Files:",
+              style="Content.TLabel", font=("Helvetica", 12, "bold"),
+              background="#34495E", foreground="#ECF0F1").pack(pady=10)
+
+    listbox_frame = ttk.Frame(dialog)
+    listbox_frame.pack(padx=10, pady=5, fill="both", expand=True)
+
+    file_listbox = tk.Listbox(listbox_frame, selectmode=tk.SINGLE,
+                              bg="#ECF0F1", fg="#2C3E50",
+                              selectbackground="#3498DB", selectforeground="white",
+                              font=("Helvetica", 10))
+    file_listbox.pack(side="left", fill="both", expand=True)
+
+    scrollbar = ttk.Scrollbar(listbox_frame, orient="vertical", command=file_listbox.yview)
+    scrollbar.pack(side="right", fill="y")
+    file_listbox.config(yscrollcommand=scrollbar.set)
+
+    json_files = [f for f in os.listdir(config_folder) if f.endswith('.json')]
+    if not json_files:
+        file_listbox.insert(tk.END, "No .json files found.")
+        file_listbox.config(state="disabled")  # Disable listbox if no files
+    else:
+        for f in sorted(json_files):
+            file_listbox.insert(tk.END, f)
+
+    def on_select():
+        nonlocal selected_file_name
+        if file_listbox.curselection():
+            selected_file_name = file_listbox.get(file_listbox.curselection())
+        dialog.destroy()
+
+    def on_cancel():
+        nonlocal selected_file_name
+        selected_file_name = None
+        dialog.destroy()
+
+    button_frame = ttk.Frame(dialog, style="Bold.TLabelframe")  # Use a frame for buttons
+    button_frame.pack(pady=10)
+    button_frame.configure(relief="flat", borderwidth=0)  # Remove border for cleaner look
+
+    select_button = ttk.Button(button_frame, text="Select", command=on_select, style="TButton")
+    select_button.pack(side="left", padx=10)
+
+    cancel_button = ttk.Button(button_frame, text="Cancel", command=on_cancel, style="TButton")
+    cancel_button.pack(side="right", padx=10)
+
+    # If no files, disable the select button
+    if not json_files:
+        select_button.config(state="disabled")
+
+    parent.wait_window(dialog)  # Wait until the dialog is closed
+
+    return selected_file_name
+
+
+def create_main_window(root, possible_interfaces_data=None):
+    """
+    Configures and displays the main Tkinter window for device configuration.
+
+    Args:
+        root (tk.Tk): The root Tkinter window.
+        possible_interfaces_data (dict, optional): A dictionary specifying available
+            interfaces and their possible IDs.
+            Example: {'SPI': [1, 2], 'I2C': [0, 1], 'UART': [1, 2]}
+            If None, all interfaces are treated as available without specific ID lists.
+    """
+    root.title("Device Configuration")
+
+    # This attribute will store the collected data before the GUI closes
+    root.collected_config_data = None
+    root.file_name_saved = None  # To store the name of the saved file or selected file
+
+    root.configure(bg="#2C3E50")
+
+    if sys.platform == "darwin":
+        try:
+            root.tk.call('tk', 'scaling', '-dpi', 72)
+            root.tk.call('set', 'tk_mac_load_uniform_theme', 1)
+        except tk.TclError:
+            pass
+
+    # --- Configure ttk.Style for various widgets ---
+    style = ttk.Style()
+    style.configure("TLabel", background="#2C3E50", foreground="#ECF0F1")
+    style.configure("MainTitle.TLabel", font=("Helvetica", 36, "bold"),
+                    background="#2C3E50", foreground="#ECF0F1")
+    style.configure("Content.TLabel", background="#34495E", foreground="#ECF0F1", font=("Helvetica", 10, "bold"))
+    style.configure("Bold.TLabelframe", background="#34495E")
+    style.configure("Bold.TLabelframe.Label", font=("Helvetica", 16, "bold"), foreground="#1A2B3C")
+    style.configure("Big.TButton", font=("Helvetica", 14, "bold"), padding=[30, 15],
+                    background="#3498DB", foreground="white")
+    style.map("Big.TButton", background=[('active', '#2980B9')], foreground=[('active', 'white')])
+    style.configure("TButton", font=("Helvetica", 12, "bold"), padding=[15, 8],
+                    background="#647B95", foreground="white")
+    style.map("TButton", background=[('active', '#5A708A')], foreground=[('active', 'white')])
+    style.configure("Small.TButton", font=("Helvetica", 9, "bold"), padding=[3, 1],
+                    background="#444444", foreground="white")
+    style.map("Small.TButton", background=[('active', '#555555')], foreground=[('active', 'white')])
+    style.configure("Large.TEntry", font=("Helvetica", 16), padding=[10, 8])
+    style.map("Large.TEntry", fieldbackground=[("focus", "#E8F0FE"), ("!focus", "white")])
+    style.configure("TCheckbutton", background="#34495E", foreground="#ECF0F1", font=("Helvetica", 10))
+    style.configure("TCombobox", fieldbackground="white", selectbackground="white", selectforeground="black")
+
+    # --- "Select file" Button ---
+    def handle_select_file():
+        selected_name = select_file_from_list_dialog(root)
+        if selected_name:
+            root.file_name_saved = selected_name
+            root.quit()  # Stop the mainloop, as if a new config was saved
+            # The root.destroy() will be handled in run_config_gui_with_interfaces
+
+    select_file_button = ttk.Button(root, text="Select File", command=handle_select_file, style="TButton")
+    select_file_button.pack(pady=10, anchor="ne", padx=10)  # Position top-right
+
+    # --- Main Application Title ---
+    title_label = ttk.Label(root, text="Device Configuration Settings", style="MainTitle.TLabel")
+    title_label.pack(pady=20, anchor="center")
+
+    # --- Configuration Name Input Section ---
+    config_name_frame = ttk.LabelFrame(root, text="Configuration Settings", padding="10", labelanchor="nw",
+                                       style="Bold.TLabelframe")
+    config_name_frame.pack(pady=10, fill="x", anchor="center")
+    config_name_frame.grid_columnconfigure(0, weight=1)
+    config_name_frame.grid_columnconfigure(1, weight=0)
+    config_name_frame.grid_columnconfigure(2, weight=0)
+    config_name_frame.grid_columnconfigure(3, weight=1)
+
+    ttk.Label(config_name_frame, text="Configuration Name:", style="Content.TLabel").grid(row=0, column=1, padx=10,
+                                                                                          pady=5, sticky="e")
+    config_name_var = tk.StringVar(root)
+    config_name_entry = ttk.Entry(config_name_frame, textvariable=config_name_var, width=40, style="Large.TEntry")
+    config_name_entry.grid(row=0, column=2, padx=10, pady=5, sticky="ew")
+
+    # --- GPIOs Section ---
+    gpio_frame = ttk.LabelFrame(root, text="GPIOs", padding="10", labelanchor="nw", style="Bold.TLabelframe")
+    gpio_frame.pack(padx=10, pady=10, fill="x", expand=True, anchor="center")
+
+    gpio_frame.grid_columnconfigure(0, weight=1)
+    gpio_frame.grid_columnconfigure(1, weight=0)  # Pin Number
+    gpio_frame.grid_columnconfigure(2, weight=0)  # Name
+    gpio_frame.grid_columnconfigure(3, weight=0)  # Mode
+    gpio_frame.grid_columnconfigure(4, weight=0)  # Pull
+    gpio_frame.grid_columnconfigure(5, weight=0)  # Delete Button
+    gpio_frame.grid_columnconfigure(6, weight=1)  # Right Spacer
+
+    ttk.Label(gpio_frame, text="Pin Number", style="Content.TLabel").grid(row=0, column=1, padx=5, pady=2, sticky="ew")
+    ttk.Label(gpio_frame, text="Name", style="Content.TLabel").grid(row=0, column=2, padx=5, pady=2, sticky="ew")
+    ttk.Label(gpio_frame, text="Mode", style="Content.TLabel").grid(row=0, column=3, padx=5, pady=2, sticky="ew")
+    ttk.Label(gpio_frame, text="Pull", style="Content.TLabel").grid(row=0, column=4, padx=5, pady=2, sticky="ew")
+
+    def remove_gpio_row(row_to_delete):
+        global gpio_input_rows
+        for key, widget_or_var in row_to_delete.items():
+            if key not in ['mode_var', 'pull_var'] and hasattr(widget_or_var, 'destroy'):
+                widget_or_var.destroy()
+        gpio_input_rows.remove(row_to_delete)
+        # Re-grid remaining rows
+        for i, row_data in enumerate(gpio_input_rows):
+            target_row_idx = i + 1
+            row_data['pin'].grid(row=target_row_idx, column=1, padx=5, pady=2, sticky="ew")
+            row_data['name'].grid(row=target_row_idx, column=2, padx=5, pady=2, sticky="ew")
+            row_data['mode_widget'].grid(row=target_row_idx, column=3, padx=5, pady=2, sticky="ew")
+            row_data['pull_widget'].grid(row=target_row_idx, column=4, padx=5, pady=2, sticky="ew")
+            row_data['delete_button'].grid(row=target_row_idx, column=5, padx=5, pady=2, sticky="ew")
+        # Update add line button position
+        add_line_button.grid(row=len(gpio_input_rows) + 1, column=1, columnspan=5, pady=10)
+
+    def add_gpio_row():
+        global gpio_row_counter
+        current_row_idx = len(gpio_input_rows) + 1
+        row_inputs = {}
+
+        pin_entry = ttk.Entry(gpio_frame, validate="key",
+                              validatecommand=(root.register(lambda P: P.isdigit() or P == ""), '%P'))
+        pin_entry.grid(row=current_row_idx, column=1, padx=5, pady=2, sticky="ew")
+        row_inputs['pin'] = pin_entry
+
+        name_entry = ttk.Entry(gpio_frame)
+        name_entry.grid(row=current_row_idx, column=2, padx=5, pady=2, sticky="ew")
+        row_inputs['name'] = name_entry
+
+        modes = ['-', "Input", "Output", "ADC", "Open-Drain"]
+        mode_var = tk.StringVar(root)
+        mode_var.set(modes[0])
+        mode_optionmenu = ttk.OptionMenu(gpio_frame, mode_var, modes[0], *modes[1:])
+        mode_optionmenu.grid(row=current_row_idx, column=3, padx=5, pady=2, sticky="ew")
+        row_inputs['mode_var'] = mode_var
+        row_inputs['mode_widget'] = mode_optionmenu
+
+        pull_options = ["-", "None", "Up", "Down"]
+        pull_var = tk.StringVar(root)
+        pull_var.set(pull_options[0])
+        pull_optionmenu = ttk.OptionMenu(gpio_frame, pull_var, pull_options[0], *pull_options[1:])
+        pull_optionmenu.grid(row=current_row_idx, column=4, padx=5, pady=2, sticky="ew")
+        row_inputs['pull_var'] = pull_var
+        row_inputs['pull_widget'] = pull_optionmenu
+
+        delete_button = ttk.Button(gpio_frame, text="X", style="Small.TButton",
+                                   command=lambda r=row_inputs: remove_gpio_row(r))
+        delete_button.grid(row=current_row_idx, column=5, padx=5, pady=2, sticky="ew")
+        row_inputs['delete_button'] = delete_button
+
+        gpio_input_rows.append(row_inputs)
+        gpio_row_counter += 1
+
+        add_line_button.grid(row=len(gpio_input_rows) + 1, column=1, columnspan=5, pady=10)
+
+    add_line_button = ttk.Button(gpio_frame, text="Add GPIO Line", command=add_gpio_row)
+    add_line_button.grid(row=1, column=1, columnspan=5, pady=10)
+
+    # Add initial GPIO rows
+    add_gpio_row()
+    add_gpio_row()
+
+    # --- Interfaces Section ---
+    interfaces_frame = ttk.LabelFrame(root, text="Interfaces", padding="10", labelanchor="nw", style="Bold.TLabelframe")
+    interfaces_frame.pack(padx=10, pady=10, fill="x", expand=True, anchor="center")
+
+    # Configure grid columns for the interfaces frame
+    # Max columns needed: Spacer (1) + Checkbox (1) + ID Label (1) + ID Combobox (1)
+    # + (Pin Label/Entry) * 4 (e.g., MOSI, MISO, SCK, CS) = 8
+    # + (Baud Label/Entry) * 1 = 2
+    # Total = 1 + 1 + 1 + 1 + 8 + 2 = 14 dynamic columns + 1 spacer = 15 columns (Col 0 to Col 14)
+    for i in range(15):
+        interfaces_frame.grid_columnconfigure(i, weight=0)
+    interfaces_frame.grid_columnconfigure(0, weight=1)  # Left spacer
+    interfaces_frame.grid_columnconfigure(14, weight=1)  # Right spacer
+
+    # Helper to toggle widget states/visibility
+    def toggle_widget_group(widgets, enable):
+        state = "normal" if enable else "disabled"
+        for widget in widgets:
+            if widget:  # Ensure the widget was actually created
+                if isinstance(widget, (ttk.Checkbutton, ttk.Combobox, ttk.OptionMenu, ttk.Entry, ttk.Button)):
+                    widget.config(state=state)
+
+    interface_row_idx = 0
+
+    # --- UART Interface Elements ---
+    interface_row_idx += 1
+    uart_is_available = True if possible_interfaces_data is None else 'UART' in (possible_interfaces_data or {})
+
+    uart_enabled = tk.BooleanVar(root)
+    uart_enabled.set(False)
+
+    uart_widgets = []  # List to hold all widgets related to UART for easy toggling
+    uart_entries = {}  # Dict to hold references to Entry/Combobox for data collection
+
+    uart_checkbox = ttk.Checkbutton(interfaces_frame, text="UART", variable=uart_enabled,
+                                    command=lambda: toggle_widget_group(uart_widgets[1:], uart_enabled.get()),
+                                    # Exclude checkbox itself
+                                    style="TCheckbutton")
+    if uart_is_available:
+        uart_checkbox.grid(row=interface_row_idx, column=1, padx=5, pady=5, sticky="w")
+    else:
+        # If UART is not available based on input data, disable checkbox and don't grid it
+        uart_checkbox.grid(row=interface_row_idx, column=1, padx=5, pady=5, sticky="w")
+        uart_checkbox.config(state="disabled")
+        uart_enabled.set(False)  # Ensure it's off if disabled
+    uart_widgets.append(uart_checkbox)
+
+    # UART ID
+    uart_id_label = ttk.Label(interfaces_frame, text="ID:", style="Content.TLabel")
+    if uart_is_available:
+        uart_id_label.grid(row=interface_row_idx, column=2, padx=5, pady=2, sticky="e")
+    uart_widgets.append(uart_id_label)
+
+    uart_id_var = tk.StringVar(root)
+    if uart_is_available and possible_interfaces_data and 'UART' in possible_interfaces_data and \
+            possible_interfaces_data['UART']:
+        # Use Combobox if IDs are provided
+        uart_id_widget = ttk.Combobox(interfaces_frame, textvariable=uart_id_var,
+                                      values=possible_interfaces_data['UART'], state="readonly", width=5)
+        if possible_interfaces_data['UART']:
+            uart_id_var.set(possible_interfaces_data['UART'][0])  # Set default to first ID
+    else:
+        # Fallback to Entry if no IDs or not dynamically specified
+        uart_id_widget = ttk.Entry(interfaces_frame, width=5)
+
+    if uart_is_available:
+        uart_id_widget.grid(row=interface_row_idx, column=3, padx=5, pady=2, sticky="ew")
+    uart_entries['id'] = uart_id_widget
+    uart_widgets.append(uart_id_widget)
+
+    # UART Baudrate
+    uart_baud_label = ttk.Label(interfaces_frame, text="Baudrate:", style="Content.TLabel")
+    if uart_is_available:
+        uart_baud_label.grid(row=interface_row_idx, column=4, padx=5, pady=2, sticky="e")
+    uart_widgets.append(uart_baud_label)
+
+    uart_baud_entry = ttk.Entry(interfaces_frame, width=8)
+    if uart_is_available:
+        uart_baud_entry.grid(row=interface_row_idx, column=5, padx=5, pady=2, sticky="ew")
+    uart_entries['baudrate'] = uart_baud_entry
+    uart_widgets.append(uart_baud_entry)
+
+    # Initially disable all UART inputs, checkbox remains active if available
+    if uart_is_available:
+        toggle_widget_group(uart_widgets[1:], False)
+
+    interface_widget_groups['UART'] = {'enabled_var': uart_enabled, 'entries': uart_entries,
+                                       'all_widgets': uart_widgets}
+
+    # --- I2C Interface Elements ---
+    interface_row_idx += 1
+    i2c_is_available = True if possible_interfaces_data is None else 'I2C' in (possible_interfaces_data or {})
+
+    i2c_enabled = tk.BooleanVar(root)
+    i2c_enabled.set(False)
+
+    i2c_widgets = []
+    i2c_entries = {}
+
+    i2c_checkbox = ttk.Checkbutton(interfaces_frame, text="I2C", variable=i2c_enabled,
+                                   command=lambda: toggle_widget_group(i2c_widgets[1:], i2c_enabled.get()),
+                                   style="TCheckbutton")
+    if i2c_is_available:
+        i2c_checkbox.grid(row=interface_row_idx, column=1, padx=5, pady=5, sticky="w")
+    else:
+        i2c_checkbox.grid(row=interface_row_idx, column=1, padx=5, pady=5, sticky="w")
+        i2c_checkbox.config(state="disabled")
+        i2c_enabled.set(False)
+    i2c_widgets.append(i2c_checkbox)
+
+    # I2C ID (optional based on possible_interfaces_data)
+    i2c_id_label = ttk.Label(interfaces_frame, text="ID:", style="Content.TLabel")
+
+    i2c_id_var = tk.StringVar(root)
+    if i2c_is_available and possible_interfaces_data and 'I2C' in possible_interfaces_data and possible_interfaces_data[
+        'I2C']:
+        i2c_id_widget = ttk.Combobox(interfaces_frame, textvariable=i2c_id_var,
+                                     values=possible_interfaces_data['I2C'], state="readonly", width=5)
+        if possible_interfaces_data['I2C']:
+            i2c_id_var.set(possible_interfaces_data['I2C'][0])
+        if i2c_is_available:  # Only grid if interface is available
+            i2c_id_label.grid(row=interface_row_idx, column=2, padx=5, pady=2, sticky="e")
+            i2c_id_widget.grid(row=interface_row_idx, column=3, padx=5, pady=2, sticky="ew")
+        i2c_entries['id'] = i2c_id_widget
+    else:
+        i2c_id_widget = None  # Ensure it's None if not created to avoid errors in toggle_widget_group
+    i2c_widgets.append(i2c_id_widget)  # Add None or actual widget
+
+    # I2C Pins (SDA, SCL) and Baud
+    # Adjust column indices based on whether ID combobox is present
+    col_offset = 2 if i2c_id_widget else 0  # If ID widgets are present, shift other widgets by 2 columns
+
+    i2c_sda_label = ttk.Label(interfaces_frame, text="SDA Pin:", style="Content.TLabel")
+    if i2c_is_available:
+        i2c_sda_label.grid(row=interface_row_idx, column=2 + col_offset, padx=5, pady=2, sticky="e")
+    i2c_widgets.append(i2c_sda_label)
+    i2c_sda_entry = ttk.Entry(interfaces_frame, validate="key", width=5,
+                              validatecommand=(root.register(lambda P: P.isdigit() or P == ""), '%P'))
+    if i2c_is_available:
+        i2c_sda_entry.grid(row=interface_row_idx, column=3 + col_offset, padx=5, pady=2, sticky="ew")
+    i2c_entries['sda_pin'] = i2c_sda_entry
+    i2c_widgets.append(i2c_sda_entry)
+
+    i2c_scl_label = ttk.Label(interfaces_frame, text="SCL Pin:", style="Content.TLabel")
+    if i2c_is_available:
+        i2c_scl_label.grid(row=interface_row_idx, column=4 + col_offset, padx=5, pady=2, sticky="e")
+    i2c_widgets.append(i2c_scl_label)
+    i2c_scl_entry = ttk.Entry(interfaces_frame, validate="key", width=5,
+                              validatecommand=(root.register(lambda P: P.isdigit() or P == ""), '%P'))
+    if i2c_is_available:
+        i2c_scl_entry.grid(row=interface_row_idx, column=5 + col_offset, padx=5, pady=2, sticky="ew")
+    i2c_entries['scl_pin'] = i2c_scl_entry
+    i2c_widgets.append(i2c_scl_entry)
+
+    i2c_baud_label = ttk.Label(interfaces_frame, text="Baud:", style="Content.TLabel")
+    if i2c_is_available:
+        i2c_baud_label.grid(row=interface_row_idx, column=6 + col_offset, padx=5, pady=2, sticky="e")
+    i2c_widgets.append(i2c_baud_label)
+    i2c_baud_entry = ttk.Entry(interfaces_frame, width=8)
+    if i2c_is_available:
+        i2c_baud_entry.grid(row=interface_row_idx, column=7 + col_offset, padx=5, pady=2, sticky="ew")
+    i2c_entries['baud'] = i2c_baud_entry
+    i2c_widgets.append(i2c_baud_entry)
+
+    if i2c_is_available:
+        toggle_widget_group(i2c_widgets[1:], False)  # Disable inputs initially
+
+    interface_widget_groups['I2C'] = {'enabled_var': i2c_enabled, 'entries': i2c_entries, 'all_widgets': i2c_widgets}
+
+    # --- SPI Interface Elements ---
+    interface_row_idx += 1
+    spi_is_available = True if possible_interfaces_data is None else 'SPI' in (possible_interfaces_data or {})
+
+    spi_enabled = tk.BooleanVar(root)
+    spi_enabled.set(False)
+
+    spi_widgets = []
+    spi_entries = {}
+
+    spi_checkbox = ttk.Checkbutton(interfaces_frame, text="SPI", variable=spi_enabled,
+                                   command=lambda: toggle_widget_group(spi_widgets[1:], spi_enabled.get()),
+                                   style="TCheckbutton")
+    if spi_is_available:
+        spi_checkbox.grid(row=interface_row_idx, column=1, padx=5, pady=5, sticky="w")
+    else:
+        spi_checkbox.grid(row=interface_row_idx, column=1, padx=5, pady=5, sticky="w")
+        spi_checkbox.config(state="disabled")
+        spi_enabled.set(False)
+    spi_widgets.append(spi_checkbox)
+
+    # SPI ID (optional based on possible_interfaces_data)
+    spi_id_label = ttk.Label(interfaces_frame, text="ID:", style="Content.TLabel")
+    spi_widgets.append(spi_id_label)  # Add to list even if not gridded
+
+    spi_id_var = tk.StringVar(root)
+    if spi_is_available and possible_interfaces_data and 'SPI' in possible_interfaces_data and possible_interfaces_data[
+        'SPI']:
+        spi_id_widget = ttk.Combobox(interfaces_frame, textvariable=spi_id_var,
+                                     values=possible_interfaces_data['SPI'], state="readonly", width=5)
+        if possible_interfaces_data['SPI']:
+            spi_id_var.set(possible_interfaces_data['SPI'][0])
+        if spi_is_available:  # Only grid if interface is available
+            spi_id_label.grid(row=interface_row_idx, column=2, padx=5, pady=2, sticky="e")
+            spi_id_widget.grid(row=interface_row_idx, column=3, padx=5, pady=2, sticky="ew")
+        spi_entries['id'] = spi_id_widget
+    else:
+        spi_id_widget = None  # Ensure it's None if not created
+    spi_widgets.append(spi_id_widget)
+
+    # SPI Pins (MOSI, MISO, SCK, CS) and Baud
+    col_offset = 2 if spi_id_widget else 0  # If ID widgets are present, shift other widgets by 2 columns
+
+    spi_mosi_label = ttk.Label(interfaces_frame, text="MOSI:", style="Content.TLabel")
+    if spi_is_available:
+        spi_mosi_label.grid(row=interface_row_idx, column=2 + col_offset, padx=2, pady=2, sticky="e")
+    spi_widgets.append(spi_mosi_label)
+    spi_mosi_entry = ttk.Entry(interfaces_frame, validate="key", width=4,
+                               validatecommand=(root.register(lambda P: P.isdigit() or P == ""), '%P'))
+    if spi_is_available:
+        spi_mosi_entry.grid(row=interface_row_idx, column=3 + col_offset, padx=2, pady=2, sticky="ew")
+    spi_entries['mosi_pin'] = spi_mosi_entry
+    spi_widgets.append(spi_mosi_entry)
+
+    spi_miso_label = ttk.Label(interfaces_frame, text="MISO:", style="Content.TLabel")
+    if spi_is_available:
+        spi_miso_label.grid(row=interface_row_idx, column=4 + col_offset, padx=2, pady=2, sticky="e")
+    spi_widgets.append(spi_miso_label)
+    spi_miso_entry = ttk.Entry(interfaces_frame, validate="key", width=4,
+                               validatecommand=(root.register(lambda P: P.isdigit() or P == ""), '%P'))
+    if spi_is_available:
+        spi_miso_entry.grid(row=interface_row_idx, column=5 + col_offset, padx=2, pady=2, sticky="ew")
+    spi_entries['miso_pin'] = spi_miso_entry
+    spi_widgets.append(spi_miso_entry)
+
+    spi_sck_label = ttk.Label(interfaces_frame, text="SCK:", style="Content.TLabel")
+    if spi_is_available:
+        spi_sck_label.grid(row=interface_row_idx, column=6 + col_offset, padx=2, pady=2, sticky="e")
+    spi_widgets.append(spi_sck_label)
+    spi_sck_entry = ttk.Entry(interfaces_frame, validate="key", width=4,
+                              validatecommand=(root.register(lambda P: P.isdigit() or P == ""), '%P'))
+    if spi_is_available:
+        spi_sck_entry.grid(row=interface_row_idx, column=7 + col_offset, padx=2, pady=2, sticky="ew")
+    spi_entries['sck_pin'] = spi_sck_entry
+    spi_widgets.append(spi_sck_entry)
+
+    spi_cs_label = ttk.Label(interfaces_frame, text="CS:", style="Content.TLabel")
+    if spi_is_available:
+        spi_cs_label.grid(row=interface_row_idx, column=8 + col_offset, padx=2, pady=2, sticky="e")
+    spi_widgets.append(spi_cs_label)
+    spi_cs_entry = ttk.Entry(interfaces_frame, state="disabled", validate="key", width=4,  # Made smaller
+                             validatecommand=(root.register(lambda P: P.isdigit() or P == ""), '%P'))
+    if spi_is_available:
+        spi_cs_entry.grid(row=interface_row_idx, column=9 + col_offset, padx=2, pady=2, sticky="ew")
+    spi_entries['cs_pin'] = spi_cs_entry
+    spi_widgets.append(spi_cs_entry)
+
+    spi_baud_label = ttk.Label(interfaces_frame, text="Baud:", style="Content.TLabel")
+    if spi_is_available:
+        spi_baud_label.grid(row=interface_row_idx, column=10 + col_offset, padx=2, pady=2, sticky="e")
+    spi_widgets.append(spi_baud_label)
+    spi_baud_entry = ttk.Entry(interfaces_frame, width=6)
+    if spi_is_available:
+        spi_baud_entry.grid(row=interface_row_idx, column=11 + col_offset, padx=2, pady=2, sticky="ew")
+    spi_entries['baud'] = spi_baud_entry
+    spi_widgets.append(spi_baud_entry)
+
+    if spi_is_available:
+        toggle_widget_group(spi_widgets[1:], False)  # Disable inputs initially
+
+    interface_widget_groups['SPI'] = {'enabled_var': spi_enabled, 'entries': spi_entries, 'all_widgets': spi_widgets}
+
+    # --- Data Collection Function ---
+    def collect_data():
+        # Initialize the dictionary to store all configuration data
+        configuration_data = {
+            "config_name": "",
+            "gpios": [],
+            "interfaces": {}
+        }
+
+        # 1. Validate Configuration Name and store it
+        config_name = config_name_var.get().strip()
+        if not config_name:
+            messagebox.showerror("Validation Error", "Configuration Name cannot be empty.")
+            return None  # Return None to indicate validation failure
+        configuration_data["config_name"] = config_name
+
+        # 2. Validate GPIOs and store them
+        gpio_list = []
+        # Keep track of unique pin numbers to check for duplicates
+        seen_gpio_pins = set()
+        # Keep track of unique GPIO names to check for duplicates
+        seen_gpio_names = set()
+        for i, row in enumerate(gpio_input_rows):
+            pin_value = row['pin'].get().strip()
+            name_value = row['name'].get().strip()
+            mode_value = row['mode_var'].get()
+            pull_value = row['pull_var'].get()
+
+            if not pin_value:
+                messagebox.showerror("Validation Error", f"GPIO line {i + 1}: 'Pin Number' cannot be empty.")
+                return None
+
+            # Check for duplicate GPIO pin numbers
+            try:
+                pin_num = int(pin_value)
+                if pin_num in seen_gpio_pins:
+                    messagebox.showerror("Validation Error",
+                                         f"GPIO line {i + 1}: Pin Number '{pin_value}' is duplicated. Each GPIO pin must have a unique number.")
+                    return None
+                seen_gpio_pins.add(pin_num)
+            except ValueError:
+                # This should ideally be caught by validatecommand, but as a fallback
+                messagebox.showerror("Validation Error", f"GPIO line {i + 1}: 'Pin Number' must be a valid integer.")
+                return None
+
+            if not name_value:
+                messagebox.showerror("Validation Error", f"GPIO line {i + 1}: 'Name' cannot be empty.")
+                return None
+
+            # Check for duplicate GPIO names
+            if name_value in seen_gpio_names:
+                messagebox.showerror("Validation Error",
+                                     f"GPIO line {i + 1}: Name '{name_value}' is duplicated. Each GPIO pin must have a unique name.")
+                return None
+            seen_gpio_names.add(name_value)
+
+            if mode_value == '-':
+                messagebox.showerror("Validation Error", f"GPIO line {i + 1}: 'Mode' must be selected.")
+                return None
+            if pull_value == '-':
+                messagebox.showerror("Validation Error", f"GPIO line {i + 1}: 'Pull' must be selected.")
+                return None
+
+            gpio_list.append({
+                "pin": int(pin_value),  # Ensure pin is stored as int
+                "name": name_value,
+                "mode": mode_value,
+                "pull": pull_value
+            })
+        configuration_data["gpios"] = gpio_list
+
+        # 3. Validate Enabled Interfaces and store them
+        interfaces_dict = {}
+
+        # Handle UART
+        uart_group = interface_widget_groups['UART']
+        if uart_group['enabled_var'].get():
+            uart_id_val = uart_group['entries']['id'].get().strip()
+            uart_baudrate = uart_group['entries']['baudrate'].get().strip()
+            if not uart_id_val:
+                messagebox.showerror("Validation Error", "UART: 'ID' cannot be empty when enabled.")
+                return None
+            if not uart_baudrate:
+                messagebox.showerror("Validation Error", "UART: 'Baudrate' cannot be empty when enabled.")
+                return None
+            try:
+                int(uart_baudrate)
+            except ValueError:
+                messagebox.showerror("Validation Error", "UART: 'Baudrate' must be an integer.")
+                return None
+            interfaces_dict["UART"] = {
+                "id": int(uart_id_val),
+                "baudrate": int(uart_baudrate)
+            }
+
+        # Handle I2C
+        i2c_group = interface_widget_groups['I2C']
+        if i2c_group['enabled_var'].get():
+            i2c_config = {}
+            # Only add ID to config if the widget was actually created (i.e., IDs were provided in input data)
+            if 'id' in i2c_group['entries'] and i2c_group['entries']['id'] is not None:
+                i2c_id_val = i2c_group['entries']['id'].get().strip()
+                if not i2c_id_val:  # This could happen if a combobox is created but not selected
+                    messagebox.showerror("Validation Error", "I2C: 'ID' cannot be empty when enabled.")
+                    return None
+                i2c_config["id"] = int(i2c_id_val)
+
+            i2c_sda_pin = i2c_group['entries']['sda_pin'].get().strip()
+            i2c_scl_pin = i2c_group['entries']['scl_pin'].get().strip()
+            i2c_baud = i2c_group['entries']['baud'].get().strip()
+
+            if not i2c_sda_pin:
+                messagebox.showerror("Validation Error", "I2C: 'SDA Pin' cannot be empty when enabled.")
+                return None
+            if not i2c_scl_pin:
+                messagebox.showerror("Validation Error", "I2C: 'SCL Pin' cannot be empty when enabled.")
+                return None
+            if not i2c_baud:
+                messagebox.showerror("Validation Error", "I2C: 'Baud' cannot be empty when enabled.")
+                return None
+            try:
+                int(i2c_baud)
+            except ValueError:
+                messagebox.showerror("Validation Error", "I2C: 'Baud' must be an integer.")
+                return None
+
+            i2c_config.update({
+                "sda_pin": int(i2c_sda_pin),
+                "scl_pin": int(i2c_scl_pin),
+                "baud": int(i2c_baud)
+            })
+            interfaces_dict["I2C"] = i2c_config
+
+        # Handle SPI
+        spi_group = interface_widget_groups['SPI']
+        if spi_group['enabled_var'].get():
+            spi_config = {}
+            if 'id' in spi_group['entries'] and spi_group['entries']['id'] is not None:
+                spi_id_val = spi_group['entries']['id'].get().strip()
+                if not spi_id_val:
+                    messagebox.showerror("Validation Error", "SPI: 'ID' cannot be empty when enabled.")
+                    return None
+                spi_config["id"] = int(spi_id_val)
+
+            spi_mosi_pin = spi_group['entries']['mosi_pin'].get().strip()
+            spi_miso_pin = spi_group['entries']['miso_pin'].get().strip()
+            spi_sck_pin = spi_group['entries']['sck_pin'].get().strip()
+            spi_cs_pin = spi_group['entries']['cs_pin'].get().strip()
+            spi_baud = spi_group['entries']['baud'].get().strip()
+
+            if not spi_mosi_pin:
+                messagebox.showerror("Validation Error", "SPI: 'MOSI Pin' cannot be empty when enabled.")
+                return None
+            if not spi_miso_pin:
+                messagebox.showerror("Validation Error", "SPI: 'MISO Pin' cannot be empty when enabled.")
+                return None
+            if not spi_sck_pin:
+                messagebox.showerror("Validation Error", "SPI: 'SCK Pin' cannot be empty when enabled.")
+                return None
+            if not spi_cs_pin:
+                messagebox.showerror("Validation Error", "SPI: 'CS Pin' cannot be empty when enabled.")
+                return None
+            if not spi_baud:
+                messagebox.showerror("Validation Error", "SPI: 'Baud' cannot be empty when enabled.")
+                return None
+            try:
+                int(spi_baud)
+            except ValueError:
+                messagebox.showerror("Validation Error", "SPI: 'Baud' must be an integer.")
+                return None
+
+            spi_config.update({
+                "mosi": int(spi_mosi_pin),
+                "miso": int(spi_miso_pin),
+                "sck": int(spi_sck_pin),
+                "cs": int(spi_cs_pin),
+                "baud": int(spi_baud)
+            })
+            interfaces_dict["SPI"] = spi_config
+
+        configuration_data["interfaces"] = interfaces_dict
+
+        # --- File Saving Logic (JSON) ---
+        config_folder = "MicropythonConfigurationFiles"
+        safe_config_name = "".join(c for c in config_name if c.isalnum() or c in (' ', '.', '_')).rstrip()
+        safe_config_name = safe_config_name.replace(' ', '_')
+        if not safe_config_name:
+            safe_config_name = "untitled_configuration"
+
+        file_path = os.path.join(config_folder, f"{safe_config_name}.json")
+
+        try:
+            os.makedirs(config_folder, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("File Error", f"Could not create folder '{config_folder}': {e}")
+            return None
+
+        if os.path.exists(file_path):
+            response = messagebox.askyesnocancel(
+                "File Exists",
+                f"A configuration file named '{safe_config_name}.json' already exists.\n\n"
+                "Do you want to replace it?\n"
+                "  - 'Yes' to overwrite\n"
+                "  - 'No' to cancel and change the configuration name\n"
+                "  - 'Cancel' to abort submission"
+            )
+            if response is False:  # User chose 'No' (change name)
+                return None
+            elif response is None:  # User chose 'Cancel'
+                return None
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as jsonfile:
+                json.dump(configuration_data, jsonfile, indent=4)
+
+            messagebox.showinfo("Success", f"Configuration saved to:\n{file_path}")
+            root.collected_config_data = configuration_data  # Store data before closing
+            root.file_name_saved = os.path.basename(file_path)  # Store the filename
+            root.quit()  # This stops the mainloop
+            # Removed root.destroy() from here. It will now be called after mainloop returns.
+
+        except Exception as e:
+            messagebox.showerror("File Save Error", f"Failed to save configuration to JSON:\n{e}")
+            return None
+
+    # "Submit" button at the bottom
+    collect_button = ttk.Button(root, text="Submit", command=collect_data, style="Big.TButton")
+    collect_button.pack(pady=20, anchor="center")
+
+    # Initial state setup for widgets after they are all gridded.
+    # This ensures consistency when the GUI first appears.
+    # We only toggle if the interface is actually available to avoid errors on non-gridded widgets
+    if 'UART' in interface_widget_groups and interface_widget_groups['UART']['all_widgets'][0].cget(
+            "state") != "disabled":
+        toggle_widget_group(interface_widget_groups['UART']['all_widgets'][1:], False)
+    if 'I2C' in interface_widget_groups and interface_widget_groups['I2C']['all_widgets'][0].cget(
+            "state") != "disabled":
+        toggle_widget_group(interface_widget_groups['I2C']['all_widgets'][1:], False)
+    if 'SPI' in interface_widget_groups and interface_widget_groups['SPI']['all_widgets'][0].cget(
+            "state") != "disabled":
+        toggle_widget_group(interface_widget_groups['SPI']['all_widgets'][1:], False)
+
+
+# New function as requested, which manages the Tkinter root and calls create_main_window
+def run_config_gui_with_interfaces(possible_interfaces_data):
+    """
+    Runs the device configuration GUI with specified possible interfaces and their IDs.
+
+    Args:
+        possible_interfaces_data (dict): A dictionary defining available interfaces
+            and their possible IDs. Example: {'SPI': [1, 2], 'I2C': [0, 1], 'UART': [1, 2]}
+            Pass None or an empty dict {} to enable all interfaces with default Entry fields for IDs.
+            If an interface key is present but its value is an empty list [], it will disable the Combobox for IDs.
+
+    Returns:
+        str: The name of the JSON file created on successful completion, or False on error/cancellation.
+    """
+    root = None  # Initialize root outside try-except for finally block or error handling
+    try:
+        root = tk.Tk()
+        # Reset global lists for a clean run if this function is called multiple times
+        # This is crucial for GUI elements that are dynamically added to global lists.
+        global gpio_input_rows, gpio_row_counter, interface_widget_groups
+        gpio_input_rows = []
+        gpio_row_counter = 0
+        interface_widget_groups = {}  # Clear previous interface widgets
+
+        create_main_window(root, possible_interfaces_data)
+
+        root.mainloop()  # Start the Tkinter event loop for this specific window
+
+        # After mainloop exits, explicitly destroy the root window if it still exists
+        # This is the correct place to destroy the window, after the mainloop has finished.
+        if root and root.winfo_exists():
+            root.destroy()
+
+        # Check root.file_name_saved to see if a file was selected/saved
+        if root.file_name_saved:
+            return root.file_name_saved
+        else:
+            # User cancelled or validation failed (collect_data returned None)
+            print("Configuration creation or file selection cancelled or failed validation during user interaction.")
+            return False
+
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        # Ensure root window is destroyed if an error occurs before mainloop starts or exits cleanly
+        if root and root.winfo_exists():  # Check if window still exists before destroying
+            root.destroy()
+        return False
+
+
+if __name__ == "__main__":
+    print("--- Running GUI with specific interfaces ---")
+    # Example usage: Only enable SPI (IDs 1 and 2), I2C (IDs 0 and 1), and UART (IDs 1, 2, 3, 4)
+    example_interfaces = {
+        'SPI': [1, 2],
+        'I2C': [0, 1],
+        'UART': [1, 2, 3, 4]
+    }
+
+    # Test case 1: With specific interfaces
+    result_filename = run_config_gui_with_interfaces(example_interfaces)
+    if result_filename:
+        print(f"\nConfiguration saved/selected file: {result_filename}")
+    else:
+        print("\nConfiguration process for Test Case 1 did not result in a saved/selected file.")

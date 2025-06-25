@@ -1,0 +1,859 @@
+import sys
+import time
+
+from machine import Pin, UART, I2C, SPI, ADC, DAC
+import network
+import machine
+from time import sleep, localtime
+import gc
+
+"""
+Functions we need to implement:
+Digital output
+Digital input
+ADC
+Interfaces (UART, I2C, SPI)
+DAC
+Overload function
+"""
+
+# Commands- needs to be the same as in the pc side
+# module|function_to_run|param1,param2,...,kwarg1=kwarg1_value,kwargs2=kwargs2_value,...
+# functions: define_pin, define_interface, set_gpio_value, get_gpio_value,
+
+# Print format:
+# INFO/ERROR || Text to display... (Errors should be tkinter popups on Mahpak-side)
+
+# Telemetry format:
+# TELEMETRY|telemetry_name|params_dict
+
+# Constants
+DEFINED_PINS = {}  # pin_num:Pin
+DEFINED_INTERFACES = {}  # (interface_type,interface_type): Interface
+MODES = {"IN": Pin.IN,
+         "OUT": Pin.OUT, "OPEN_DRAIN": Pin.OPEN_DRAIN}
+DRIVES = [Pin.DRIVE_0, Pin.DRIVE_1, Pin.DRIVE_2, Pin.DRIVE_3]
+
+NETWORK_HANDLER = None
+
+
+
+class Telemetry:
+    @staticmethod
+    def info(message):
+        _, _, _, hours, minutes, seconds, _, _ = localtime()
+        sys.stdout.write(f"{hours}:{minutes}:{seconds}\tINFO || {message}\n")
+
+    @staticmethod
+    def error(message):
+        _, _, _, hours, minutes, seconds, _, _ = localtime()
+        sys.stdout.write(f"{hours}:{minutes}:{seconds}\tERROR || {message}\n")
+
+    @staticmethod
+    def telemetry(func_name, telemetry_params):
+        telemetry = f"TELEMETRY|{func_name.upper()}"
+        if isinstance(telemetry_params, (tuple, list)):
+            for param in telemetry_params:
+                telemetry += f"|{param}"
+        elif isinstance(telemetry_params, dict):
+            for key, value in telemetry_params.items():
+                telemetry += f"|{key}|{value}"
+        else:
+            telemetry += f"|{telemetry_params}"
+        telemetry += "\n"
+        sys.stdout.write(telemetry)
+
+    @staticmethod
+    def telemetry(func_name, telemetry_data):
+        if not isinstance(telemetry_data, dict):
+            Telemetry.error(
+                f"Telemetry.telemetry expects a dictionary for telemetry_data. Received: {type(telemetry_data)}")
+            telemetry_data = {"value": telemetry_data}  # Wrap it in a dict
+
+        telemetry = f"TELEMETRY|{func_name.upper()}"
+        params_str = ",".join([f"{key}={value}" for key, value in telemetry_data.items()])
+        telemetry += f"|{params_str}\n"
+
+        sys.stdout.write(telemetry)
+
+
+class Device:
+    @staticmethod
+    def scan_single_interface(interface_func):
+        interface_id = 0
+        first_interface_id = 0
+
+        # find the first valid id of interface
+        stop_loop = False
+        while not stop_loop:
+            try:
+                interface_func(first_interface_id)
+                stop_loop = True
+                interface_id = first_interface_id
+            except Exception as e:
+                first_interface_id += 1
+                if first_interface_id > 10:
+                    return None
+
+        # find the last valid id of interface
+        stop_loop = False
+        while not stop_loop:
+            try:
+                interface_func(interface_id)
+                interface_id += 1
+            except Exception as e:
+                interface_id -= 1
+                stop_loop = True
+
+        return (first_interface_id, interface_id)
+
+    @staticmethod
+    def scan_interfaces(interfaces_functions=(UART, I2C, SPI)):
+        result = {}
+        for function in interfaces_functions:
+            result[function.__name__] = Device.scan_single_interface(function)
+        Telemetry.info(f"Scanned for available interfaces in the device and found: {result}")
+        Telemetry.telemetry("scan_interfaces", result)
+        return True
+
+    @staticmethod
+    def hard_reset_device():
+        try:
+            Telemetry.info(f"Got reset request, restarting device...")
+            machine.reset()
+        except Exception as e:
+            Telemetry.error(f"Failed restarting the device with error: {e}")
+            return False
+
+    @staticmethod
+    def soft_reset_device():
+        try:
+            Telemetry.info(f"Got soft-reset request, soft-restarting device...")
+            machine.soft_reset()
+        except Exception as e:
+            Telemetry.error(f"Failed soft-restarting the device with error: {e}")
+            return False
+
+    @staticmethod
+    def light_sleep(timeout_ms=None):
+        timeout_ms = int(timeout_ms)
+
+        try:
+            if timeout_ms is None:
+                Telemetry.info(f"Going to light-Sleep without timeout ...ZZZ...ZZZ")
+                machine.lightsleep()
+            else:
+                Telemetry.info(f"Going to light-Sleep for {timeout_ms}ms ...ZZZ...ZZZ")
+                machine.lightsleep(timeout_ms)
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed going to light sleep with timeout of:{timeout_ms}ms with error: {e}")
+            return False
+
+    @staticmethod
+    def deep_sleep(timeout_ms=None):
+        timeout_ms = int(timeout_ms)
+        try:
+            if timeout_ms is None:
+                Telemetry.info(f"Going to deep-Sleep without timeout ...ZZZ...ZZZ")
+                machine.deepsleep()
+            else:
+                Telemetry.info(f"Going to deep-Sleep for {timeout_ms}ms ...ZZZ...ZZZ")
+                machine.deepsleep(timeout_ms)
+        except Exception as e:
+            Telemetry.error(f"Failed going to deep-sleep with timeout of:{timeout_ms}ms with error: {e}")
+            return False
+
+    @staticmethod
+    def reset_cause():
+        try:
+            cause = machine.reset_cause()
+            Telemetry.info(f"Got reset_cause request... Last reset cause:{cause}")
+            Telemetry.telemetry("reset_cause", {"reset_cause":cause})
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed getting reset cause with error: {e}")
+            return False
+
+    @staticmethod
+    def wake_reason():
+        try:
+            reason = machine.wake_reason()
+            Telemetry.info(f"Got wake_reason request... Last wake reason:{reason}")
+            Telemetry.telemetry("wake_reason", {"reason":reason})
+            return True
+        except Exception as e:
+            Telemetry.error(f"Got reset_cause request but failed with the error: {e}")
+            return False
+
+
+class PinHandler:
+    @staticmethod
+    def define_pin(pin_number, **kwargs):
+
+        # Putting default values in the non-mandatory ones
+        drive = 0
+        value = None
+        pull = None
+        pin_mode = -1
+
+        try:
+            if "mode" in kwargs:
+                pin_mode = MODES[kwargs["mode"]]
+            if "drive" in kwargs:
+                drive = DRIVES[int(kwargs["drive"])]
+            if "pull" in kwargs:
+                if kwargs["pull"] == "PULL_UP":
+                    pull = Pin.PULL_UP
+                elif kwargs["pull"] == "PULL_DOWN":
+                    pull = Pin.PULL_DOWN
+            if "value" in kwargs:
+                value = int(kwargs["value"])
+
+        except Exception as e:
+            Telemetry.error(f"One of the arguments given to define_pin is broken!\n {e}")
+            return False
+
+        if pin_number in DEFINED_PINS.keys():
+            Telemetry.info(f"Pin {pin_number} was already configured, configuring it again... ")
+
+        try:
+            DEFINED_PINS[pin_number] = Pin(int(pin_number), pin_mode, drive=drive, value=1, pull=pull)
+            Telemetry.info(
+                f"Configured a new pin! pin {pin_number} with: mode:{pin_mode}, drive:{drive}, value:{value}, pull:{pull}")
+
+        except Exception as e:
+            Telemetry.error(f"Failed to configure pin with {pin_number, pin_mode, drive, value, pull}! \n {e}")
+            return False
+
+        return True
+
+    @staticmethod
+    def define_adc_pin(pin_number):
+        if pin_number in DEFINED_PINS.keys():
+            Telemetry.info(f"Pin {pin_number} was already configured, configuring it again...")
+
+        try:
+            DEFINED_PINS[pin_number] = ADC(int(pin_number))
+            Telemetry.info(f"Configured a new ADC pin! pin {pin_number}")
+
+        except Exception as e:
+            Telemetry.error(f"Failed to configure ADC pin {pin_number}! \n {e}")
+            return False
+
+        return True
+
+    @staticmethod
+    def define_dac_pin(pin_number, **kwargs):
+        depth = 8
+        if "depth" in kwargs:
+            depth = int(kwargs["depth"])
+        if pin_number in DEFINED_PINS.keys():
+            Telemetry.info(f"Pin {pin_number} was already configured, configuring it again...")
+
+        try:
+            DEFINED_PINS[pin_number] = DAC(int(pin_number), bits=depth)
+            Telemetry.info(f"Configured a new DAC pin! pin {pin_number} with depth of: {depth}bits")
+            return True
+        except Exception as e:
+            Telemetry.info(f"Failed to configure DAC pin {pin_number}! with depth of: {depth}bits. Error: {e}")
+            return False
+
+    @staticmethod
+    def set_gpio_value(pin_num, value):
+        try:
+            DEFINED_PINS[pin_num].value(int(value))
+            Telemetry.info(f"Set the value of pin {pin_num} to {value} successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed to set the value of pin {pin_num} to {value} with error: {e}")
+            return False
+
+    @staticmethod
+    def get_gpio_value(pin_num):
+        try:
+            value = DEFINED_PINS[pin_num].value()
+            Telemetry.info(f"pin{pin_num}: {value}")
+            Telemetry.telemetry("get_gpio_value", {"value":value})
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed to get the value of pin{pin_num}! \n {e}")
+            return False
+
+    @staticmethod
+    def read_adc(pin_num, **kwargs):
+        pin = DEFINED_PINS[pin_num]
+        ref_voltage = 3.3
+        depth = 8
+        if "ref_voltage" in kwargs:
+            ref_voltage = float(kwargs["ref_voltage"])
+        if "depth" in kwargs:
+            depth = int(kwargs["depth"])
+
+        try:
+            read = pin.read()
+            read_voltage = read * ref_voltage / (2 ** depth)
+            Telemetry.info(
+                f"pin{pin_num} got the value: {read}. assumed depth of {depth}bits and ref_voltage of {ref_voltage} and got: {read_voltage}")
+            Telemetry.telemetry("get_gpio_value", {"adc_read_absolute_value": read})
+        except Exception as e:
+            Telemetry.error(f"Couldn't read the voltage on adc pin: {pin_num} with error: {e}")
+            return False
+
+    @staticmethod
+    def write_dac(pin_num, value):
+        try:
+            DEFINED_PINS[pin_num].write(int(value))
+            Telemetry.info(f"Set the value of DAC pin {pin_num} to {value} successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed to set the value of DAC pin {pin_num} to {value} with error: {e}")
+            return False
+
+
+class UartHandler:
+
+    @staticmethod
+    def define(uart_id, **kwargs):
+        if ("UART", uart_id) in DEFINED_INTERFACES.keys():
+            Telemetry.info(f"UART{uart_id} was already configured, configuring it again...")
+
+        baud_rate = kwargs["baudrate"]
+        uart = UART(int(uart_id), int(baud_rate))
+
+        if len(kwargs) > 1:
+            rx_pin = kwargs["rx"]
+            tx_pin = kwargs["tx"]
+            if rx_pin in DEFINED_PINS.keys():
+                Telemetry.info(f"Pin {rx_pin} was already configured, configuring it again...")
+            if tx_pin in DEFINED_PINS.keys():
+                Telemetry.info(f"Pin {tx_pin} was already configured, configuring it again...")
+
+            try:
+                if "cts" in kwargs.keys() and "rts" in kwargs.keys():  # TODO: check if flow control works
+                    uart.init(baudrate=baud_rate, bits=8, parity=None, stop=1, rx=int(rx_pin), tx=int(tx_pin),
+                              rts=int(kwargs["rts"]), cts=int(kwargs["cts"]))
+                elif "cts" in kwargs.keys():
+                    uart.init(baudrate=baud_rate, bits=8, parity=None, stop=1, rx=int(rx_pin), tx=int(tx_pin),
+                              cts=int(kwargs["cts"]))
+                elif "rts" in kwargs.keys():
+                    uart.init(baudrate=baud_rate, bits=8, parity=None, stop=1, rx=int(rx_pin), tx=int(tx_pin),
+                              rts=int(kwargs["rts"]))
+                else:
+                    uart.init(baudrate=baud_rate, bits=8, parity=None, stop=1, rx=int(rx_pin), tx=int(tx_pin))
+            except Exception as e:
+                Telemetry.error(f"Failed to configure UART{uart_id} with the params: {kwargs}. the error: {e}")
+                return False
+
+        DEFINED_INTERFACES[("UART", uart_id)] = uart
+        Telemetry.info(f"Configured a new Interface! Uart{uart_id} with the params: {kwargs}")
+        return True
+
+    @staticmethod
+    def write(uart_id, buf):
+        uart = DEFINED_INTERFACES[("UART", uart_id)]
+        uart.write(buf.encode())
+        Telemetry.info(f"Sent over UART{uart_id} the following: {buf}")
+
+    @staticmethod
+    def read(uart_id, max_bytes=None):
+        uart = DEFINED_INTERFACES[("UART", uart_id)]
+
+        if uart.any() != 0:
+            try:
+                if max_bytes is None:
+                    buf = uart.read()
+                else:
+                    buf = uart.read(max_bytes)
+            except Exception as e:
+                Telemetry.error(f"Failed to read on UART[{uart_id}] with the error: {e}")
+                return False
+
+            Telemetry.info(f"Read over UART[{uart_id}] the following: {buf}")
+        return True
+
+    @staticmethod
+    def read_line(uart_id):
+        uart = DEFINED_INTERFACES[("UART", uart_id)]
+        try:
+            buf = uart.readline()
+        except Exception as e:
+            Telemetry.error(f"Failed to read on UART[{uart_id}] with the error: {e}")
+            return False
+        Telemetry.info(f"Read over UART[{uart_id}] the following: {buf}")
+        return True
+
+    @staticmethod
+    def turn_off(uart_id):
+        uart = DEFINED_INTERFACES[("UART", uart_id)]
+        try:
+            uart.deinit()
+        except Exception as e:
+            Telemetry.error(f"Failed to turn off UART[{uart_id}] with the error: {e}")
+            return False
+        Telemetry.info(f"Turned off UART[{uart_id}]")
+        return True
+
+
+class I2CHandler:
+    @staticmethod
+    def define(i2c_id, **kwargs):
+        if ("I2C", i2c_id) in DEFINED_INTERFACES.keys():
+            Telemetry.info(f"I2C{i2c_id} was already configured, configuring it again...")
+
+        try:
+            scl = int(kwargs["scl"])
+            sda = int(kwargs["sda"])
+            freq = int(kwargs["freq"])
+            DEFINED_INTERFACES[("I2C", i2c_id)] = I2C(int(i2c_id), scl=scl, sda=sda, freq=freq)
+            Telemetry.info(f"Configured a new Interface! I2C{i2c_id} with the params: {kwargs}")
+            return True
+
+        except Exception as e:
+            Telemetry.error(f"Failed to configure I2C{i2c_id} with the params: {kwargs}. The error: {e}")
+            return False
+
+    @staticmethod
+    def scan_i2c_devices(i2c_id):
+        try:
+            address_list = DEFINED_INTERFACES[("I2C", i2c_id)].scan()
+            Telemetry.info(f"Scanned for I2C devices connected to I2C{i2c_id} and found:{address_list}")
+            telemtry_dict = {}
+            for index, address in enumerate(address_list):
+                telemtry_dict["address"+str(index)] = address
+            Telemetry.telemetry("scan_i2c_devices", telemtry_dict)
+        except Exception as e:
+            Telemetry.error(f"Failed scanning from devices on I2C[{i2c_id}]! error: {e}")
+            return False
+        return True
+
+    @staticmethod
+    def write(i2c_id, address, buf):
+        i2c = DEFINED_INTERFACES[("I2C", i2c_id)]
+        try:
+            i2c.writeto(hex(address), buf.encode())
+            Telemetry.info(f"Sent over I2C[{i2c_id}] to address:{address} the following buffer: {buf}")
+        except Exception as e:
+            Telemetry.error(
+                f"Failed Sending over I2C[{i2c_id}]the message:{buf}, To address: {address} with the error: {e}")
+            return False
+
+    @staticmethod
+    def read(i2c_id, address, n_bytes):
+        i2c = DEFINED_INTERFACES[("I2C", i2c_id)]
+        try:
+            buf = i2c.readfrom(hex(address), int(n_bytes))
+            Telemetry.info(f"Read over I2C[{i2c_id}] from address: {address}, buffer: {buf}")
+        except Exception as e:
+            Telemetry.error(f"Failed reading over I2C[{i2c_id}] from address: {address} with the error: {e}")
+            return False
+        return True
+
+    @staticmethod
+    def mem_read(i2c_id, device_address, memory_address, n_bytes, memory_address_size=8):
+        i2c = DEFINED_INTERFACES[("I2C", i2c_id)]
+        try:
+            buf = i2c.readfrom_mem(hex(device_address), hex(memory_address), int(n_bytes), addrsize=int(memory_address_size))
+            Telemetry.info(
+                f"Read from memory over I2C[{i2c_id}]. address: {memory_address}, buffer size in bytes: {n_bytes}, address size: {memory_address_size}, buffer: {buf}")
+            return True
+        except Exception as e:
+            Telemetry.error(
+                f"Failed Reading from memory over I2C[{i2c_id}]. address: {memory_address}, address size: {memory_address_size}, buffer size in bytes: {n_bytes}, with the error: {e}")
+            return False
+
+    @staticmethod
+    def mem_write(i2c_id, device_address, memory_address, buffer, memory_address_size=8):
+        i2c = DEFINED_INTERFACES[("I2C", i2c_id)]
+        try:
+            i2c.writeto_mem(hex(device_address), hex(memory_address), buffer.encode(), addrsize=int(memory_address_size))
+            Telemetry.info(
+                f"Wrote to memory over I2C[{i2c_id}]. address: {memory_address}, address size: {memory_address_size}, buffer: {buffer}")
+        except Exception as e:
+            Telemetry.error(
+                f"Failed Reading from memory over I2C[{i2c_id}]. address: {memory_address}, address size: {memory_address_size}, with the error: {e}")
+            return False
+        return True
+
+
+class SPIHandler:
+    @staticmethod
+    def define(spi_id, **kwargs):
+        if ("SPI", spi_id) in DEFINED_INTERFACES.keys():
+            Telemetry.info(f"SPI{spi_id} was already configured, configuring it again...")
+
+        mosi = int(kwargs["mosi"])
+        miso = int(kwargs["miso"])
+        sck = int(kwargs["sck"])
+        baud_rate = int(kwargs["baudrate"])
+        firstbit = SPI.MSB
+        if "firstbit" in kwargs.keys():
+            if kwargs["firstbit"] == "LSB":
+                firstbit = SPI.LSB
+            else:
+                firstbit = SPI.MSB
+
+        mosi_pin = Pin(mosi)
+        miso_pin = Pin(miso)
+        sck_pin = Pin(sck)
+
+        # define CS pins as outputs
+        cs_pins = kwargs["cs"].strip("()").split(",")
+        for cs in cs_pins:
+            if PinHandler.define_pin(cs, mode="OUT", value=1) is False:
+                Telemetry.error(
+                    f"Failed to configure SPI{spi_id} with the params: {kwargs}. Error: Failed to configure cs pin:{cs}")
+                return False
+
+        try:
+            spi = SPI(int(spi_id), baudrate=baud_rate, mosi=mosi_pin, miso=miso_pin, sck=sck_pin,
+                      firstbit=firstbit)
+        except Exception as e:
+            Telemetry.error(f"Failed to configure SPI[{spi_id}] with the params: {kwargs}. the error: {e}")
+            return False
+
+        DEFINED_INTERFACES[("SPI", spi_id)] = spi
+        Telemetry.info(f"Configured a new Interface! SPI[{spi_id}] with the params: {kwargs}")
+        return True
+
+    @staticmethod
+    def spi_transaction_fixed(spi_id, cs, command, response_len="0", dummy_byte="00"):
+        spi = DEFINED_INTERFACES["SPI", spi_id]
+
+        # convert params from string
+        command = bytes([int(command[i:i + 2], 16) for i in range(0, len(command), 2)])
+        dummy_byte =  int(dummy_byte, 16)
+        response_len = int(response_len)
+
+        # set cs low to start communication
+        if not PinHandler.set_gpio_value(cs, 0):
+            Telemetry.error(
+                f"Failed to set CS pin: {cs} low for SPI communication")
+            return False
+
+        # Send command from master to slave
+        try:
+            spi.write(command)
+            Telemetry.info(f"Sent over SPI[{spi_id}]. CS: {cs}, buffer: {command}")
+        except Exception as e:
+            Telemetry.error(f"Failed to send over SPI[{spi_id}]! CS: {cs}, buffer: {command}. the error: {e}")
+            return False
+
+        # get response (if no response set response_len to 0)
+        if response_len > 0:
+            try:
+                response = spi.read(response_len, dummy_byte)
+                Telemetry.info(f"read over SPI[{spi_id}]. CS: {cs}, buffer: {response} with length of: {response_len}")
+            except Exception as e:
+                Telemetry.error(
+                    f"Failed to read over SPI[{spi_id}]! n_bytes: {response_len}, CS: {cs}, dummy_byte: {dummy_byte}. the error: {e}")
+                return False
+
+        if not PinHandler.set_gpio_value(cs, 1):
+            Telemetry.error(
+                f"Failed to set CS pin: {cs} high to end SPI communication")
+            return False
+
+        return True
+
+    @staticmethod
+    def spi_transaction_variable(spi_id, cs, command, dummy_byte="00"):
+        spi = DEFINED_INTERFACES["SPI", spi_id]
+
+        # convert params from string
+        command = bytes([int(command[i:i + 2], 16) for i in range(0, len(command), 2)])
+        dummy_byte =  int(dummy_byte, 16)
+
+        # set cs low to start communication
+        if not PinHandler.set_gpio_value(cs, 0):
+            Telemetry.error(
+                f"Failed to set CS pin: {cs} low for SPI communication")
+            return False
+
+        # Send from master to slave
+        try:
+            spi.write(command)
+            Telemetry.info(f"Sent over SPI[{spi_id}]. CS: {cs}, buffer: {command}")
+        except Exception as e:
+            Telemetry.error(f"Failed to send over SPI[{spi_id}]! CS: {cs}, buffer: {command}. the error: {e}")
+            return False
+
+        try:
+            response_len = spi.read(1, dummy_byte)[0]
+            Telemetry.info(f"read response len over SPI[{spi_id}]. CS: {cs}, response_len: {response_len}")
+
+            if response_len != 0 and response_len != 0xff:
+                response = spi.read(response_len, dummy_byte)
+                Telemetry.info(f"read over SPI[{spi_id}]. CS: {cs}, buffer: {response} with length of {response_len}, dummy_byte: {dummy_byte}")
+        except Exception as e:
+            Telemetry.error(
+                f"Failed to read over SPI[{spi_id}]! CS: {cs}, dummy_byte: {dummy_byte}. the error: {e}")
+            return False
+
+        if not PinHandler.set_gpio_value(cs, 1):
+            Telemetry.error(
+                f"Failed to set CS pin: {cs} high to end SPI communication")
+            return False
+
+        return True
+
+    @staticmethod
+    def turn_off(spi_id):
+        spi = DEFINED_INTERFACES[("UART", spi_id)]
+        try:
+            spi.deinit()
+        except Exception as e:
+            Telemetry.error(f"Failed to turn off SPI[{spi_id}] with the error: {e}")
+            return False
+        Telemetry.info(f"Turned off SPI[{spi_id}]")
+        return True
+
+
+class NetworkHandler:
+    @staticmethod
+    def define():
+        global NETWORK_HANDLER
+        try:
+            NETWORK_HANDLER = network.WLAN(network.WLAN.IF_STA)
+            Telemetry.info(f"Set station network interface successfully")
+        except Exception as e:
+            Telemetry.error(f"Error while setting network interface with error: {e}")
+            return False
+
+        time.sleep(0.1)
+        return_value = NetworkHandler.activate()
+        return return_value
+
+    @staticmethod
+    def activate():
+        try:
+            NETWORK_HANDLER.active(True)
+            Telemetry.info(f"Activated wifi interface successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed activating wifi interface with error: {e}")
+            return False
+
+    @staticmethod
+    def deactivate():
+        try:
+            NETWORK_HANDLER.active(False)
+            Telemetry.info(f"Deactivated wifi interface successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed deactivating wifi interface with error: {e}")
+            return False
+
+    @staticmethod
+    def connect(ssid="default_ssid", password="Aa123456"):
+        global NETWORK_HANDLER
+        try:
+            NETWORK_HANDLER.connect(ssid, password)
+            Telemetry.info(f"Connected to AP with ssid:{ssid} and password:{password} successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed connecting to AP with ssid:{ssid} and password:{password}. Error: {e}")
+            return False
+
+    @staticmethod
+    def disconnect():
+        global NETWORK_HANDLER
+        try:
+            NETWORK_HANDLER = network.disconnect()
+            Telemetry.info(f"Disconnected from AP successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed disconnecting from AP with error: {e}")
+            return False
+
+    @staticmethod
+    def is_connected():
+        try:
+            status = NETWORK_HANDLER.isconnected()
+            Telemetry.info(f"Wifi connection status is: {status}")
+            Telemetry.telemetry("is_connected", {"status":status})
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed checking wifi connection status with error: {e}")
+            return False
+
+    @staticmethod
+    def ifconfig():
+        try:
+            config = NETWORK_HANDLER.ipconfig('addr4')
+            Telemetry.info(f"Got ifconfig request. ip:{config[0]}, mask:{config[1]}")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed getting ip from ifconfig request with error:{e}")
+            return False
+
+    @staticmethod
+    def ipconfig():
+        try:
+            config = NETWORK_HANDLER.ipconfig('addr4')
+            Telemetry.info(f"Got ipconfig request. ip:{config[0]}, mask:{config[1]}")
+            Telemetry.telemetry("ipconfig", {"ip":config[0], "mask": config[1]})
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed getting ip from ipconfig request with error:{e}")
+            return False
+
+    @staticmethod
+    def get_default_gateway():
+        try:
+            default_gateway = NETWORK_HANDLER.ipconfig('gw4')
+            Telemetry.info(f"Got get default gateway request. default gateway:{default_gateway}")
+            Telemetry.telemetry("get_default_gateway", {"default_gateway":default_gateway})
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed getting ip from ipconfig request with error:{e}")
+            return False
+
+    @staticmethod
+    def scan():
+        try:
+            Telemetry.info("Scanning for Wi-Fi networks...")
+            scanned_aps = NETWORK_HANDLER.scan()
+            ap_dict = {}
+            for index, ap in enumerate(scanned_aps):
+                ssid = ap[0].decode('utf-8', 'ignore')
+                bssid = ':'.join('%02x' % b for b in ap[1])
+                channel = ap[2]
+                rssi = ap[3]
+                auth_mode = ap[4]
+                hidden = ap[5]
+                ap_info = {"ssid": ssid, "bssid": bssid, "channel": channel,
+                           "rssi": rssi, "auth_mode": auth_mode, "hidden": hidden}
+                ap_dict["ap"+str(index)] = ap_info
+                Telemetry.info(f"SSID: {ssid}, RSSI: {rssi}, Channel: {channel}")
+            Telemetry.telemetry("scan", ap_dict)
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed to scan for Wi-Fi networks: {e}")
+            return False
+
+    @staticmethod
+    def rssi():
+        try:
+            rssi = NETWORK_HANDLER.status('rssi')
+            Telemetry.info(f"Got rssi request. rssi:{rssi}")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed getting rssi with error:{e}")
+            return False
+
+    @staticmethod
+    def set_tx_power(power_in_dbm):
+        try:
+            NETWORK_HANDLER.config(txpower=int(power_in_dbm))
+            Telemetry.info(f"Set transmit power to {power_in_dbm}dBm successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed to set transmit power to: {power_in_dbm} with error:{e}")
+            return False
+
+    @staticmethod
+    def set_mac_address(mac="010203040506"):
+        mac = bytes([int(mac[i:i + 2], 16) for i in range(0, len(mac), 2)])
+        try:
+            NETWORK_HANDLER.config(mac=mac)
+            Telemetry.info(f"Set mac address to: {mac} successfully!")
+            return True
+        except Exception as e:
+            Telemetry.error(f"Failed to set mac address to {mac} with error: {e}")
+            return False
+
+
+def parse_arguments(arguments):
+    args_array = arguments.split(",")
+    args = []
+    kwargs = {}
+    for param in args_array:
+        if "=" in param:
+            key, val = param.split("=", 1)
+            kwargs[key.strip()] = val.strip()
+        else:
+            args.append(param.strip())
+    return args, kwargs
+
+
+def parse_command(line):
+    line = line.strip()
+
+    if not line:
+        return True
+    Telemetry.info(f"Received command: '{line}'")
+
+    if line.lower() == "exit":
+        Telemetry.info(f"Script is stopping, going back to REPL")
+        return False
+
+    # parse command
+    command = line.split("|")
+    module_name = command[0]
+    func_name = command[1]
+    if module_name not in globals():
+        Telemetry.error(f"Tried to run module '{module_name}' which does not exist")
+        return False
+
+    # parse arguments
+    args = []
+    kwargs = {}
+    if len(command) > 2 and command[2] != '':
+        args, kwargs = parse_arguments(command[2])
+        Telemetry.info(f"Running on module: '{module_name}' the function: '{func_name}' with args: {args} kwargs:{kwargs}")
+    else:
+        Telemetry.info(f"Running on module: '{module_name}' the function: '{func_name}' with no arguments")
+
+    # execute command
+    try:
+        module = globals()[module_name]
+        method = getattr(module, func_name)
+        result = method(*args, **kwargs)  # all functions should return Boolean success codes, and print their own errors
+        if not result:
+            return False
+    except Exception as e:
+        Telemetry.error(
+            f"Failed running on module: '{module_name}' the function: '{func_name}' with with args: {args} kwargs:{kwargs} \n {e}")
+        return False
+
+    return True
+
+
+def wait_for_commands():
+    sys.stdout.write("Command-   [Module|function_in_main.py|param1,param2...,kwarg1=val1,kwarg2=val2,...] \n")
+    sys.stdout.write("Type 'exit' to stop this script\n")
+    sys.stdout.write("> ")
+
+    while True:
+        try:
+            line = sys.stdin.readline()  # this command is halting the script
+
+            if line:
+                result = parse_command(line)  # returns false if we need to stop the loop-Error/Exit command
+                if not result:
+                    break
+
+                sys.stdout.write("> ")
+
+            sleep(0.01)
+
+        except KeyboardInterrupt:
+            sys.stdout.write("\nKeyboard Interrupt detected. Exiting main loop.\n")
+            break
+        except Exception as e:
+            sys.stderr.write(f"Error in main loop: {e}\n")
+            sleep(1)
+
+        finally:
+            clean_after_loop()
+
+
+def clean_after_loop():
+    gc.collect()
+
+
+if __name__ == '__main__':
+    NetworkHandler.define()
+    NetworkHandler.scan()
+
